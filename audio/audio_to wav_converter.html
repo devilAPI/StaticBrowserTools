@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Offline Converter — Audio to WAV</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; max-width: 980px; }
+    h1 { margin: 0 0 6px 0; }
+    .muted { color:#666; font-size: 13px; }
+    .card { border: 1px solid #ddd; border-radius: 16px; padding: 16px; margin: 14px 0; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .full { grid-column: 1 / -1; }
+    label { display:block; font-size: 13px; color:#333; margin-bottom:6px; }
+    input, select, button { width: 100%; padding: 10px 12px; border-radius: 12px; border: 1px solid #ccc; }
+    button { cursor: pointer; font-weight: 650; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    #dropZone { border: 2px dashed #bbb; padding: 22px; border-radius: 16px; text-align:center; color:#444; }
+    #dropZone.drag { border-color:#666; background:#fafafa; }
+    .ok { color: #0a7; font-weight: 650; }
+    .err { color: #c22; font-weight: 650; }
+    .kv { display:grid; grid-template-columns: 150px 1fr; gap: 8px; font-size: 14px; }
+    .kv div:nth-child(odd) { color:#666; }
+    a.dl { display:inline-block; padding: 10px 12px; border: 1px solid #ccc; border-radius: 12px; text-decoration:none; }
+  </style>
+</head>
+<body>
+  <h1>Audio → WAV (offline, single HTML)</h1>
+  <div class="muted">Runs fully in your browser, no server. Output is WAV (PCM 16-bit).</div>
+
+  <div class="card">
+    <div id="dropZone">
+      <div><strong>Drop an audio file here</strong> or pick one:</div>
+      <div style="margin-top:12px;">
+        <input id="fileInput" type="file" accept="audio/*" />
+      </div>
+      <div class="muted" style="margin-top:10px;">
+        Note: supported input formats depend on the browser (MP3/WAV usually work; M4A/OGG vary).
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label for="outSampleRate">Output sample rate</label>
+        <select id="outSampleRate">
+          <option value="8000">8000 Hz</option>
+          <option value="16000">16000 Hz</option>
+          <option value="22050">22050 Hz</option>
+          <option value="44100" selected>44100 Hz</option>
+          <option value="48000">48000 Hz</option>
+        </select>
+      </div>
+
+      <div>
+        <label for="channelMode">Channels</label>
+        <select id="channelMode">
+          <option value="keep" selected>Keep original</option>
+          <option value="mono">Mono</option>
+          <option value="stereo">Stereo</option>
+        </select>
+      </div>
+
+      <div>
+        <label for="trimStart">Trim start (seconds)</label>
+        <input id="trimStart" type="number" min="0" step="0.01" value="0" />
+      </div>
+
+      <div>
+        <label for="trimEnd">Trim end (seconds, empty = until end)</label>
+        <input id="trimEnd" type="number" min="0" step="0.01" placeholder="e.g. 12.50" />
+      </div>
+
+      <div class="full">
+        <label><input id="normalizePeak" type="checkbox" /> Normalize (peak to -1 dBFS)</label>
+        <div class="muted">Simple peak normalization (not loudness matching).</div>
+      </div>
+
+      <div class="full">
+        <button id="convertBtn" disabled>Convert to WAV</button>
+      </div>
+    </div>
+
+    <div id="status" class="muted" style="margin-top:12px;"></div>
+
+    <div id="fileInfo" class="kv" style="margin-top:12px; display:none;"></div>
+
+    <div id="downloadArea" style="margin-top:14px;"></div>
+  </div>
+
+<script>
+(() => {
+  const els = {
+    dropZone: document.getElementById("dropZone"),
+    fileInput: document.getElementById("fileInput"),
+    outSampleRate: document.getElementById("outSampleRate"),
+    channelMode: document.getElementById("channelMode"),
+    trimStart: document.getElementById("trimStart"),
+    trimEnd: document.getElementById("trimEnd"),
+    normalizePeak: document.getElementById("normalizePeak"),
+    convertBtn: document.getElementById("convertBtn"),
+    status: document.getElementById("status"),
+    fileInfo: document.getElementById("fileInfo"),
+    downloadArea: document.getElementById("downloadArea"),
+  };
+
+  let currentFile = null;
+  let decodedBuffer = null;
+
+  function setStatus(message, kind = "muted") {
+    els.status.className = kind === "ok" ? "ok" : kind === "err" ? "err" : "muted";
+    els.status.textContent = message;
+  }
+
+  function renderFileInfo(buf) {
+    els.fileInfo.style.display = "grid";
+    els.fileInfo.innerHTML = `
+      <div>File</div><div>${escapeHtml(currentFile?.name ?? "-")}</div>
+      <div>Duration</div><div>${buf.duration.toFixed(2)} s</div>
+      <div>Sample rate</div><div>${buf.sampleRate} Hz</div>
+      <div>Channels</div><div>${buf.numberOfChannels}</div>
+    `;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"
+    }[c]));
+  }
+
+  async function decodeAudioFile(file) {
+    const arrayBuffer = await file.arrayBuffer();
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new AudioCtx();
+    try {
+      // Some browsers are picky; slicing makes it more robust in certain cases.
+      const buf = await ctx.decodeAudioData(arrayBuffer.slice(0));
+      return buf;
+    } finally {
+      try { await ctx.close(); } catch {}
+    }
+  }
+
+  function clamp(v, min, max) {
+    return Math.max(min, Math.min(max, v));
+  }
+
+  function sliceAudioBuffer(buf, startSec, endSecOrNull) {
+    const sr = buf.sampleRate;
+    const startSecClamped = clamp(startSec, 0, buf.duration);
+    const endSecClamped = endSecOrNull == null ? buf.duration : clamp(endSecOrNull, 0, buf.duration);
+
+    const start = Math.floor(startSecClamped * sr);
+    const end = Math.floor(endSecClamped * sr);
+    const length = Math.max(0, end - start);
+
+    const out = new AudioBuffer({
+      length,
+      numberOfChannels: buf.numberOfChannels,
+      sampleRate: sr,
+    });
+
+    for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+      const src = buf.getChannelData(ch);
+      const dst = out.getChannelData(ch);
+      dst.set(src.subarray(start, start + length));
+    }
+    return out;
+  }
+
+  async function resampleAudioBuffer(buf, targetSampleRate) {
+    if (buf.sampleRate === targetSampleRate) return buf;
+
+    const targetLength = Math.ceil(buf.duration * targetSampleRate);
+    const offline = new OfflineAudioContext(buf.numberOfChannels, targetLength, targetSampleRate);
+
+    const src = offline.createBufferSource();
+    src.buffer = buf;
+    src.connect(offline.destination);
+    src.start(0);
+
+    return await offline.startRendering();
+  }
+
+  function convertChannels(buf, mode) {
+    if (mode === "keep") return buf;
+
+    const targetChannels = mode === "mono" ? 1 : 2;
+    if (buf.numberOfChannels === targetChannels) return buf;
+
+    const out = new AudioBuffer({
+      length: buf.length,
+      numberOfChannels: targetChannels,
+      sampleRate: buf.sampleRate,
+    });
+
+    const ch0 = buf.getChannelData(0);
+    const ch1 = buf.numberOfChannels > 1 ? buf.getChannelData(1) : ch0;
+
+    if (targetChannels === 1) {
+      const dst = out.getChannelData(0);
+      for (let i = 0; i < buf.length; i++) {
+        dst[i] = 0.5 * (ch0[i] + ch1[i]);
+      }
+    } else {
+      out.getChannelData(0).set(ch0);
+      out.getChannelData(1).set(ch1);
+    }
+
+    return out;
+  }
+
+  function peakNormalize(buf) {
+    let peak = 0;
+    for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+      const data = buf.getChannelData(ch);
+      for (let i = 0; i < data.length; i++) {
+        const a = Math.abs(data[i]);
+        if (a > peak) peak = a;
+      }
+    }
+    if (peak <= 0) return buf;
+
+    // Target peak at about -1 dBFS
+    const target = Math.pow(10, -1 / 20);
+    const gain = target / peak;
+
+    const out = new AudioBuffer({
+      length: buf.length,
+      numberOfChannels: buf.numberOfChannels,
+      sampleRate: buf.sampleRate,
+    });
+
+    for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+      const src = buf.getChannelData(ch);
+      const dst = out.getChannelData(ch);
+      for (let i = 0; i < src.length; i++) dst[i] = src[i] * gain;
+    }
+    return out;
+  }
+
+  function encodeWavPcm16(audioBuffer) {
+    const numChannels = audioBuffer.numberOfChannels;
+    const sampleRate = audioBuffer.sampleRate;
+    const length = audioBuffer.length;
+
+    const bytesPerSample = 2; // 16-bit PCM
+    const blockAlign = numChannels * bytesPerSample;
+    const byteRate = sampleRate * blockAlign;
+    const dataSize = length * blockAlign;
+
+    const ab = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(ab);
+
+    const writeString = (offset, str) => {
+      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+    };
+
+    // RIFF header
+    writeString(0, "RIFF");
+    view.setUint32(4, 36 + dataSize, true);
+    writeString(8, "WAVE");
+
+    // fmt chunk
+    writeString(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); // PCM
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, 16, true); // bits per sample
+
+    // data chunk
+    writeString(36, "data");
+    view.setUint32(40, dataSize, true);
+
+    // Interleave and write samples
+    const channels = [];
+    for (let ch = 0; ch < numChannels; ch++) channels.push(audioBuffer.getChannelData(ch));
+
+    let offset = 44;
+    for (let i = 0; i < length; i++) {
+      for (let ch = 0; ch < numChannels; ch++) {
+        let s = channels[ch][i];
+        s = Math.max(-1, Math.min(1, s));
+        const int16 = s < 0 ? s * 0x8000 : s * 0x7fff;
+        view.setInt16(offset, int16, true);
+        offset += 2;
+      }
+    }
+
+    return new Blob([ab], { type: "audio/wav" });
+  }
+
+  async function loadFile(file) {
+    currentFile = file;
+    decodedBuffer = null;
+    els.downloadArea.innerHTML = "";
+    els.convertBtn.disabled = true;
+    els.fileInfo.style.display = "none";
+
+    setStatus("Decoding audio…");
+    try {
+      const buf = await decodeAudioFile(file);
+      decodedBuffer = buf;
+      renderFileInfo(buf);
+      els.convertBtn.disabled = false;
+      setStatus("Ready.", "ok");
+    } catch (err) {
+      console.error(err);
+      setStatus("Could not decode this file. The format might not be supported by your browser.", "err");
+    }
+  }
+
+  // Drag & drop
+  els.dropZone.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    els.dropZone.classList.add("drag");
+  });
+  els.dropZone.addEventListener("dragleave", () => els.dropZone.classList.remove("drag"));
+  els.dropZone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    els.dropZone.classList.remove("drag");
+    const file = e.dataTransfer.files?.[0];
+    if (file) loadFile(file);
+  });
+
+  // File picker
+  els.fileInput.addEventListener("change", (e) => {
+    const file = e.target.files?.[0];
+    if (file) loadFile(file);
+  });
+
+  // Convert
+  els.convertBtn.addEventListener("click", async () => {
+    if (!decodedBuffer || !currentFile) return;
+
+    els.convertBtn.disabled = true;
+    els.downloadArea.innerHTML = "";
+    setStatus("Converting…");
+
+    try {
+      const targetSampleRate = parseInt(els.outSampleRate.value, 10);
+      const channelMode = els.channelMode.value;
+
+      const trimStart = parseFloat(els.trimStart.value || "0");
+      const trimEndText = els.trimEnd.value.trim();
+      const trimEnd = trimEndText === "" ? null : parseFloat(trimEndText);
+
+      let buf = decodedBuffer;
+
+      // Trim
+      const needsTrim = trimStart > 0 || (trimEnd !== null && trimEnd < buf.duration);
+      if (needsTrim) {
+        buf = sliceAudioBuffer(buf, trimStart, trimEnd);
+      }
+
+      // Channel conversion
+      buf = convertChannels(buf, channelMode);
+
+      // Resample
+      buf = await resampleAudioBuffer(buf, targetSampleRate);
+
+      // Normalize
+      if (els.normalizePeak.checked) {
+        buf = peakNormalize(buf);
+      }
+
+      // WAV encode
+      const wavBlob = encodeWavPcm16(buf);
+
+      const baseName = currentFile.name.replace(/\.[^/.]+$/, "");
+      const outName = `${baseName}_${buf.sampleRate}Hz_${buf.numberOfChannels}ch.wav`;
+
+      const url = URL.createObjectURL(wavBlob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = outName;
+      a.className = "dl";
+      a.textContent = `Download: ${outName}`;
+
+      els.downloadArea.appendChild(a);
+      setStatus("Done.", "ok");
+    } catch (err) {
+      console.error(err);
+      setStatus("Conversion failed.", "err");
+    } finally {
+      els.convertBtn.disabled = false;
+    }
+  });
+
+})();
+</script>
+</body>
+</html>
